@@ -228,10 +228,10 @@ def level_label(level: str) -> str:
 
 
 def get_client() -> Anthropic:
-    api_key = os.getenv("ANTHROPIC_API_KEY")
+    api_key = st.secrets.get("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. Add it to a .env file in the project root."
+            "ANTHROPIC_API_KEY is not set. Add it to a .env file or Streamlit Secrets."
         )
     return Anthropic(api_key=api_key)
 
