@@ -23,10 +23,16 @@ import streamlit as st
 from anthropic import Anthropic, APIError, APIConnectionError
 from dotenv import load_dotenv
 from matplotlib.lines import Line2D
+from streamlit.errors import StreamlitSecretNotFoundError
 
 load_dotenv()
 
 MODEL_NAME = "claude-sonnet-4-6"
+
+# Maximum total clarifying-question rounds Claude may ask (the initial batch counts as
+# round 1, plus up to 2 follow-up rounds), so the chat can't loop forever if Claude never
+# says CONTEXT_COMPLETE on its own.
+MAX_CLARIFICATION_ROUNDS = 3
 
 # Ordinal scale shared by AI severity and user ratings, low to high. These are
 # internal canonical codes (always English); UI_LEVEL_LABELS translates them for display.
@@ -94,6 +100,10 @@ UI_TRANSLATIONS = {
         "identify_risks_button": "Выявить риски",
         "warning_empty_description": "Пожалуйста, сначала введите описание проекта.",
         "spinner_analyzing": "Анализ рисков проекта с помощью Claude...",
+        "context_gathering_header": "Уточнение деталей проекта",
+        "chat_placeholder": "Введите ваш ответ...",
+        "initial_description_sent": "Описание отправлено. Claude задаёт уточняющие вопросы...",
+        "context_complete_message": "У меня достаточно информации. Генерирую анализ рисков...",
         "error_api": "Не удалось связаться с API Claude: {error}",
         "error_analysis": "Анализ рисков не удался: {error}",
         "step2_header": "Шаг 2: Просмотр и оценка рисков",
@@ -137,6 +147,10 @@ UI_TRANSLATIONS = {
         "identify_risks_button": "Identify Risks",
         "warning_empty_description": "Please enter a project description first.",
         "spinner_analyzing": "Analyzing project risks with Claude...",
+        "context_gathering_header": "Clarifying Project Details",
+        "chat_placeholder": "Type your answer...",
+        "initial_description_sent": "Description sent. Claude is asking clarifying questions...",
+        "context_complete_message": "I have enough information. Generating the risk analysis...",
         "error_api": "Could not reach the Claude API: {error}",
         "error_analysis": "Risk analysis failed: {error}",
         "step2_header": "Step 2: Review and Rate Risks",
@@ -181,6 +195,10 @@ UI_TRANSLATIONS = {
         "identify_risks_button": "Виявити ризики",
         "warning_empty_description": "Будь ласка, спочатку введіть опис проєкту.",
         "spinner_analyzing": "Аналіз ризиків проєкту за допомогою Claude...",
+        "context_gathering_header": "Уточнення деталей проєкту",
+        "chat_placeholder": "Введіть вашу відповідь...",
+        "initial_description_sent": "Опис надіслано. Claude задає уточнювальні запитання...",
+        "context_complete_message": "У мене достатньо інформації. Генерую аналіз ризиків...",
         "error_api": "Не вдалося зв'язатися з API Claude: {error}",
         "error_analysis": "Аналіз ризиків не вдався: {error}",
         "step2_header": "Крок 2: Перегляд та оцінка ризиків",
@@ -211,6 +229,16 @@ SYSTEM_PROMPT_BASE = (
     'translate this field), and "recommendation" (1-2 sentences of mitigation advice).'
 )
 
+CONTEXT_GATHERING_SYSTEM_PROMPT_BASE = (
+    "You are a risk analysis consultant. Your goal is to gather enough context about a "
+    "project to perform accurate risk analysis. Ask 3-5 targeted clarifying questions "
+    "about aspects not mentioned in the description (budget, team size, timeline, target "
+    "market, competition, monetization). Ask all questions in one message as a numbered "
+    "list. After receiving answers, decide if you have enough context. If yes, respond "
+    "with exactly this phrase: 'CONTEXT_COMPLETE' followed by a brief summary of what you "
+    "learned. If not, ask 1-2 more targeted questions."
+)
+
 
 def get_ui_language() -> str:
     return st.session_state.get("ui_language", "ru")
@@ -228,7 +256,12 @@ def level_label(level: str) -> str:
 
 
 def get_client() -> Anthropic:
-    api_key = st.secrets.get("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+    try:
+        api_key = st.secrets.get("ANTHROPIC_API_KEY")
+    except StreamlitSecretNotFoundError:
+        # No secrets.toml at all (normal for local dev) - fall back to .env below.
+        api_key = None
+    api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError(
             "ANTHROPIC_API_KEY is not set. Add it to a .env file or Streamlit Secrets."
@@ -264,6 +297,17 @@ def escape_markdown_dollar(text: str) -> str:
     normal word spacing and looks like the text "ran together".
     """
     return text.replace("$", "\\$")
+
+
+def sanitize_chat_text(text: str) -> str:
+    """Make a chat message safe to render with st.write().
+
+    Strips leading Markdown heading markers (Claude sometimes opens a reply with
+    "# Title", which st.write() renders as a giant <h1>) and escapes $ for the same
+    reason as escape_markdown_dollar.
+    """
+    text = re.sub(r"(?m)^#{1,6}[ \t]+", "", text)
+    return escape_markdown_dollar(text)
 
 
 def prepare_html_cell(text: str) -> str:
@@ -310,6 +354,80 @@ def call_claude_for_risks(project_description: str, analysis_language: str) -> l
     return risks
 
 
+def build_context_gathering_prompt(analysis_language: str) -> str:
+    language_name = ANALYSIS_LANGUAGE_PROMPT_NAMES[analysis_language]
+    return (
+        f"{CONTEXT_GATHERING_SYSTEM_PROMPT_BASE} Respond in {language_name}. Do not use "
+        "Markdown heading syntax (#) - write plain sentences and a numbered list only."
+    )
+
+
+def request_clarifying_response(analysis_language: str) -> str:
+    """Ask Claude for the next clarifying-question turn, given the chat so far. Raises on failure."""
+    client = get_client()
+    response = client.messages.create(
+        model=MODEL_NAME,
+        max_tokens=1024,
+        system=build_context_gathering_prompt(analysis_language),
+        messages=st.session_state.chat_history,
+    )
+    return normalize_text(response.content[0].text)
+
+
+def build_context_text(chat_history: list[dict]) -> str:
+    """Flatten the clarification chat into a single text block for risk analysis."""
+    speaker_labels = {"user": "Entrepreneur", "assistant": "Consultant"}
+    lines = [f"{speaker_labels[message['role']]}: {message['content']}" for message in chat_history]
+    return "\n\n".join(lines)
+
+
+def finalize_context_and_generate_risks(analysis_language: str) -> bool:
+    """Announce that context-gathering is done and generate the risk list. Returns success."""
+    st.session_state.chat_history.append(
+        {"role": "assistant", "content": tr("context_complete_message")}
+    )
+    context_text = build_context_text(st.session_state.chat_history)
+    with st.spinner(tr("spinner_analyzing")):
+        try:
+            st.session_state.risks = call_claude_for_risks(context_text, analysis_language)
+        except (APIError, APIConnectionError) as error:
+            st.error(tr("error_api", error=error))
+            return False
+        except (RuntimeError, json.JSONDecodeError) as error:
+            st.error(tr("error_analysis", error=error))
+            return False
+    st.session_state.chat_active = False
+    return True
+
+
+def advance_clarification(analysis_language: str, spinner_message: str | None = None) -> bool:
+    """Get Claude's next clarifying turn, or finalize once context is sufficient. Returns success."""
+    if st.session_state.clarification_rounds >= MAX_CLARIFICATION_ROUNDS:
+        return finalize_context_and_generate_risks(analysis_language)
+
+    with st.spinner(spinner_message or tr("spinner_analyzing")):
+        try:
+            raw_text = request_clarifying_response(analysis_language)
+        except (APIError, APIConnectionError) as error:
+            st.error(tr("error_api", error=error))
+            return False
+
+    if raw_text.strip().startswith("CONTEXT_COMPLETE"):
+        return finalize_context_and_generate_risks(analysis_language)
+
+    st.session_state.chat_history.append({"role": "assistant", "content": raw_text})
+    st.session_state.clarification_rounds += 1
+    return True
+
+
+def start_context_gathering(description: str, analysis_language: str) -> bool:
+    """Kick off the clarification chat with the user's initial project description."""
+    st.session_state.chat_history = [{"role": "user", "content": description}]
+    st.session_state.chat_active = True
+    st.session_state.clarification_rounds = 0
+    return advance_clarification(analysis_language, spinner_message=tr("initial_description_sent"))
+
+
 def level_from_combined_score(combined_score: int) -> str:
     """Map a probability+criticality score (2-6) to a Low/Medium/High risk level."""
     if combined_score <= 3:
@@ -328,12 +446,21 @@ def init_session_state() -> None:
         st.session_state.risks = None  # list of risk dicts once Step 2 succeeds
     if "matrix_generated" not in st.session_state:
         st.session_state.matrix_generated = False
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []  # [{"role": "user"/"assistant", "content": "..."}]
+    if "chat_active" not in st.session_state:
+        st.session_state.chat_active = False
+    if "clarification_rounds" not in st.session_state:
+        st.session_state.clarification_rounds = 0
 
 
 def reset_results() -> None:
-    """Discard any previously generated risks - used when the analysis language changes."""
+    """Discard any previous chat/results - used when the analysis language changes."""
     st.session_state.risks = None
     st.session_state.matrix_generated = False
+    st.session_state.chat_history = []
+    st.session_state.chat_active = False
+    st.session_state.clarification_rounds = 0
 
 
 def use_example_description() -> None:
@@ -386,6 +513,20 @@ def render_step1() -> str | None:
             return None
         return description
     return None
+
+
+def render_context_chat(analysis_language: str) -> None:
+    st.header(tr("context_gathering_header"))
+
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.write(sanitize_chat_text(message["content"]))
+
+    user_reply = st.chat_input(tr("chat_placeholder"))
+    if user_reply:
+        st.session_state.chat_history.append({"role": "user", "content": user_reply})
+        if advance_clarification(analysis_language):
+            st.rerun()
 
 
 def render_step2() -> None:
@@ -595,18 +736,16 @@ def main() -> None:
     render_header()
 
     if st.session_state.risks is None:
-        description = render_step1()
-        if description:
-            analysis_language = st.session_state.get("analysis_language", "ru")
-            with st.spinner(tr("spinner_analyzing")):
-                try:
-                    st.session_state.risks = call_claude_for_risks(description, analysis_language)
-                except (APIError, APIConnectionError) as error:
-                    st.error(tr("error_api", error=error))
-                except (RuntimeError, json.JSONDecodeError) as error:
-                    st.error(tr("error_analysis", error=error))
-            if st.session_state.risks:
-                st.rerun()
+        analysis_language = st.session_state.get("analysis_language", "ru")
+
+        if not st.session_state.chat_active:
+            description = render_step1()
+            if description:
+                if start_context_gathering(description, analysis_language):
+                    st.rerun()
+            return
+
+        render_context_chat(analysis_language)
         return
 
     render_step2()
